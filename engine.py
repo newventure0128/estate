@@ -238,11 +238,15 @@ def irr(cfs: List[float]) -> Tuple[float, bool]:
 
     LO, HI = -0.99, 100.0
 
-    # 1) Newton-Raphson
+    # 1) Newton-Raphson — 브래킷 [LO,HI] 이탈 시 즉시 이분법으로(발산·오버플로 방지).
+    #    rate를 항상 브래킷 안으로만 갱신하므로 (1+rate)**t 오버플로가 발생하지 않는다.
     rate = 0.10
     for _ in range(200):
-        f = npv(rate, cfs)
-        deriv = sum(-t * cf / (1 + rate) ** (t + 1) for t, cf in enumerate(cfs))
+        try:
+            f = npv(rate, cfs)
+            deriv = sum(-t * cf / (1 + rate) ** (t + 1) for t, cf in enumerate(cfs))
+        except OverflowError:
+            break
         if deriv == 0:
             break
         new = rate - f / deriv
@@ -252,10 +256,15 @@ def irr(cfs: List[float]) -> Tuple[float, bool]:
             if LO < new < HI:
                 return new, True
             break
+        if not (LO < new < HI):     # Newton 발산(브래킷 밖) → 이분법 폴백
+            break
         rate = new
 
     # 2) bisection 폴백
-    flo, fhi = npv(LO, cfs), npv(HI, cfs)
+    try:
+        flo, fhi = npv(LO, cfs), npv(HI, cfs)
+    except OverflowError:
+        return math.nan, False
     if flo * fhi > 0:
         return math.nan, False
     lo, hi = LO, HI

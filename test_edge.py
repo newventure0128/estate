@@ -223,6 +223,27 @@ check("E5 IRR 무효 시 NaN & passes=False & '산출 불가' 사유",
       and (not rm["passes"]) and ("IRR 산출 불가" in rm["fail_reasons"]),
       f"valid={rm['equity_irr_valid']} reasons={rm['fail_reasons']}")
 
+# E6 [회귀] 대규모 손실 딜 — Newton 발산으로 (1+rate)**t 오버플로하던 케이스.
+#     크래시 없이 유효한 음수 IRR을 반환해야 함(NPV(irr)≈0).
+cf_div = [-942.27, 6.47, 3.71, 48.35, 3.83, 48.25, 1.59, 27.17, 2.14, 94.36]
+r6, ok6 = irr(cf_div)
+check("E6 발산 유발 손실 딜 → 크래시 없이 유효 음수 IRR",
+      ok6 and r6 < 0 and approx(npv(r6, cf_div), 0.0, tol=1e-4),
+      f"irr={r6*100:.3f}%")
+
+# E7 [회귀] 무작위 스트레스: irr이 어떤 입력에도 예외(OverflowError 등) 없이 종료
+import random as _rnd
+_rnd.seed(20260610)
+_crash = 0
+for _ in range(20000):
+    _n = _rnd.randint(2, 15)
+    _cfs = [-_rnd.uniform(1, 1e10)] + [_rnd.uniform(-1e8, 1e9) for _ in range(_n)]
+    try:
+        irr(_cfs)
+    except Exception:  # noqa
+        _crash += 1
+check("E7 무작위 2만건 IRR 무예외(오버플로 방지)", _crash == 0, f"crash={_crash}")
+
 
 # =========================================================================== #
 # F. NPV ↔ IRR 일관성 (§11)
