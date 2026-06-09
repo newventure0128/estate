@@ -1,0 +1,21 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.ipynb_checkpoints/
+
+# 가상환경
+.venv/
+venv/
+env/
+
+# Streamlit secrets
+.streamlit/secrets.toml
+
+# 실데이터(감사 프로포마) — 공개 레포 제외
+*.xlsx
+*.xlsm
+
+# OS
+.DS_Store
+Thumbs.db

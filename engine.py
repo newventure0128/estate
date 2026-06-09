@@ -11,7 +11,7 @@ Deal Screener — 계산 엔진 (engine.py)
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import List, Tuple, Dict, Any
 
 
@@ -40,6 +40,8 @@ class Deal:
     hurdle_irr: float       # 목표 Equity IRR = NPV 할인율 (%pt)
     min_dscr: float         # 최소 DSCR (배)
     max_ltv: float          # LTV 상한 (%pt)
+    capex_reserve_pct: float = 0.0  # 자본리저브(CapEx/TI/LC), EGI 대비 %pt.
+    #                                 현금흐름에서만 차감 — NOI·Cap·DSCR·TV는 불변(렌더 관행).
 
 
 def _pct(x: float) -> float:
@@ -75,9 +77,18 @@ def validate(d: Deal) -> List[str]:
     for val, name in [
         (d.gpr1, "GPR"), (d.other_income, "기타수입"),
         (d.acq_cost_pct, "취득부대비용"), (d.rate, "대출금리"),
+        (d.capex_reserve_pct, "자본리저브"), (d.opex1, "운영비용(OpEx)"),
     ]:
         if val < 0:
             errs.append(f"{name}은(는) 음수일 수 없습니다.")
+    if d.min_dscr < 0:
+        errs.append("최소 DSCR은 음수일 수 없습니다.")
+
+    # 성장률 하한: (1+g) <= 0 이면 기하급수가 부호 진동 → 무의미한 NOI 빌드업 차단.
+    if d.rent_growth <= -100:
+        errs.append("임대료 성장률은 -100%보다 커야 합니다.")
+    if d.opex_basis == "absolute" and d.opex_growth <= -100:
+        errs.append("비용상승률은 -100%보다 커야 합니다.")
 
     # 자기자본 > 0 직접 강제 (= Loan < Price×(1+acq%))  ⟺  LTV < 1 + acq%
     loan = d.price * _pct(d.ltv)
@@ -100,12 +111,15 @@ def validate(d: Deal) -> List[str]:
 # --------------------------------------------------------------------------- #
 # NOI 빌드업 (t = 1 .. n+1) — Exit 포워드 NOI를 명시 계산
 # --------------------------------------------------------------------------- #
-def project_noi(d: Deal) -> List[float]:
-    """길이 n+1 리스트. index 0 = 1년차 NOI ... index n = (n+1)년차 NOI."""
+def noi_breakdown(d: Deal) -> List[Dict[str, float]]:
+    """t = 1 .. n+1 각 연차의 NOI 구성요소(GPR·기타·EGI·OpEx·NOI).
+
+    UI의 NOI 빌드업 표가 계산 로직을 중복하지 않도록 엔진이 단일 출처로 제공한다.
+    """
     g = _pct(d.rent_growth)
     v = _pct(d.vacancy)
     i = _pct(d.opex_growth)
-    noi: List[float] = []
+    rows: List[Dict[str, float]] = []
     for t in range(1, d.hold_years + 2):  # 1 .. n+1
         gpr = d.gpr1 * (1 + g) ** (t - 1)
         other = d.other_income * (1 + g) ** (t - 1)
@@ -114,8 +128,16 @@ def project_noi(d: Deal) -> List[float]:
             opex = egi * _pct(d.opex1)          # EGI 추종 (opex_growth 무시)
         else:
             opex = d.opex1 * (1 + i) ** (t - 1)  # 절대금액 성장
-        noi.append(egi - opex)
-    return noi
+        rows.append({
+            "year": t, "gpr": gpr, "other": other,
+            "egi": egi, "opex": opex, "noi": egi - opex,
+        })
+    return rows
+
+
+def project_noi(d: Deal) -> List[float]:
+    """길이 n+1 리스트. index 0 = 1년차 NOI ... index n = (n+1)년차 NOI."""
+    return [row["noi"] for row in noi_breakdown(d)]
 
 
 def terminal_value(d: Deal, noi: List[float]) -> float:
@@ -126,14 +148,28 @@ def terminal_value(d: Deal, noi: List[float]) -> float:
 
 
 # --------------------------------------------------------------------------- #
+# 자본리저브 (CapEx/TI/LC) — 현금흐름에서만 차감. NOI/Cap/DSCR/TV는 불변.
+# --------------------------------------------------------------------------- #
+def reserve_schedule(d: Deal, breakdown: List[Dict[str, float]] | None = None) -> List[float]:
+    """t = 1 .. n 각 운영연도의 자본리저브 = EGI_t × capexReserve%."""
+    if breakdown is None:
+        breakdown = noi_breakdown(d)
+    p = _pct(d.capex_reserve_pct)
+    return [breakdown[t]["egi"] * p for t in range(d.hold_years)]
+
+
+# --------------------------------------------------------------------------- #
 # 현금흐름
 # --------------------------------------------------------------------------- #
-def unlevered_cf(d: Deal, noi: List[float], net_sale: float) -> List[float]:
+def unlevered_cf(d: Deal, noi: List[float], net_sale: float,
+                 reserve: List[float] | None = None) -> List[float]:
     n = d.hold_years
+    if reserve is None:
+        reserve = [0.0] * n
     cf = [-d.price * (1 + _pct(d.acq_cost_pct))]   # CF_0
     for t in range(1, n):                          # 1 .. n-1
-        cf.append(noi[t - 1])
-    cf.append(noi[n - 1] + net_sale)               # n년차 + Exit
+        cf.append(noi[t - 1] - reserve[t - 1])
+    cf.append(noi[n - 1] - reserve[n - 1] + net_sale)  # n년차 + Exit
     return cf
 
 
@@ -169,14 +205,17 @@ def debt_schedule(d: Deal) -> Tuple[List[float], float]:
 
 
 def levered_cf(d: Deal, noi: List[float], net_sale: float,
-               ds: List[float], payoff: float) -> Tuple[List[float], float]:
+               ds: List[float], payoff: float,
+               reserve: List[float] | None = None) -> Tuple[List[float], float]:
     n = d.hold_years
+    if reserve is None:
+        reserve = [0.0] * n
     loan = d.price * _pct(d.ltv)
     equity0 = d.price * (1 + _pct(d.acq_cost_pct)) - loan
     cf = [-equity0]                                # CF_0
     for t in range(1, n):                          # 1 .. n-1
-        cf.append(noi[t - 1] - ds[t - 1])
-    cf.append(noi[n - 1] - ds[n - 1] + net_sale - payoff)  # n년차
+        cf.append(noi[t - 1] - ds[t - 1] - reserve[t - 1])
+    cf.append(noi[n - 1] - ds[n - 1] + net_sale - payoff - reserve[n - 1])  # n년차
     return cf, equity0
 
 
@@ -233,30 +272,75 @@ def irr(cfs: List[float]) -> Tuple[float, bool]:
 
 
 # --------------------------------------------------------------------------- #
+# 대출 사이징 제약 (표시 전용 — 실제 대출은 여전히 Price×LTV)
+# --------------------------------------------------------------------------- #
+def sizing_constraints(d: Deal) -> Dict[str, Any]:
+    """LTV 한도·DSCR 한도 대출액과 binding 제약을 산출(읽기전용).
+
+    실무에서 대출은 min(LTV한도, DSCR한도)로 사이징된다. 본 스크리너는 사이징을
+    적용하지 않고 '어느 제약이 binding인지'만 보여준다(현금흐름 엔진 무변경).
+    DSCR 한도는 보수적으로 1년차 NOI 기준(최소 DSCR이 통상 1년차에 발생).
+    """
+    noi1 = project_noi(d)[0]
+    r = _pct(d.rate)
+    loan_cap_ltv = d.price * _pct(d.max_ltv)
+
+    if d.min_dscr <= 0:
+        loan_cap_dscr = math.inf
+    elif d.amort_type == "IO":
+        loan_cap_dscr = math.inf if r == 0 else noi1 / (d.min_dscr * r)
+    else:
+        N = d.amort_term_years
+        factor = (1.0 / N) if r == 0 else r / (1 - (1 + r) ** (-N))  # 연금계수
+        loan_cap_dscr = noi1 / (d.min_dscr * factor)
+
+    binding_loan = min(loan_cap_ltv, loan_cap_dscr)
+    binding = "LTV" if loan_cap_ltv <= loan_cap_dscr else "DSCR"
+    return {
+        "loan_cap_ltv": loan_cap_ltv,
+        "loan_cap_dscr": loan_cap_dscr,
+        "binding_loan": binding_loan,
+        "binding": binding,
+        "implied_max_ltv": binding_loan / d.price,
+    }
+
+
+# --------------------------------------------------------------------------- #
 # 종합 지표 (§5 핵심 비율 + §3 스크리닝)
 # --------------------------------------------------------------------------- #
 def evaluate(d: Deal) -> Dict[str, Any]:
     """검증 통과를 전제로 전체 지표를 계산해 dict 반환."""
-    noi = project_noi(d)
+    breakdown = noi_breakdown(d)
+    noi = [row["noi"] for row in breakdown]
+    reserve = reserve_schedule(d, breakdown)
     net_sale = terminal_value(d, noi)
 
-    ucf = unlevered_cf(d, noi, net_sale)
+    ucf = unlevered_cf(d, noi, net_sale, reserve)
     proj_irr, proj_valid = irr(ucf)
 
     ds, payoff = debt_schedule(d)
-    lcf, equity0 = levered_cf(d, noi, net_sale, ds, payoff)
+    lcf, equity0 = levered_cf(d, noi, net_sale, ds, payoff, reserve)
     eq_irr, eq_valid = irr(lcf)
 
     hurdle = _pct(d.hurdle_irr)
     eq_npv = npv(hurdle, lcf)
 
     going_in_cap = noi[0] / d.price
+    cap_spread = _pct(d.exit_cap) - going_in_cap   # +면 캡 확장(가치 하락 위험)
 
     dscrs = [math.inf if ds[t] == 0 else noi[t] / ds[t] for t in range(d.hold_years)]
     min_dscr = min(dscrs)
     dscr_y1 = dscrs[0]
 
-    coc = lcf[1] / equity0 if equity0 != 0 else math.nan  # 1년차 차입 현금흐름 / 자기자본
+    # '운영' 차입 현금흐름(Exit 제외) = NOI − DS − Reserve, 연도별.
+    op_cf = [noi[t] - ds[t] - reserve[t] for t in range(d.hold_years)]
+    # 1년차 CoC: 보유 1년(n=1)일 때 lcf[1]에 매각대금이 섞이는 오염 방지 위해 운영 CF로 명시.
+    coc = op_cf[0] / equity0 if equity0 != 0 else math.nan
+    # 평균 CoC: 보유기간 운영 현금흐름 평균 / 자기자본 (Exit 제외 — 순수 운영 현금이익률).
+    coc_avg = (sum(op_cf) / d.hold_years) / equity0 if equity0 != 0 else math.nan
+
+    loan = d.price * _pct(d.ltv)
+    debt_yield = math.inf if loan == 0 else noi[0] / loan  # 렌더 핵심지표 NOI₁/Loan
 
     pos = sum(x for x in lcf if x > 0)
     neg = sum(x for x in lcf if x < 0)
@@ -294,10 +378,138 @@ def evaluate(d: Deal) -> Dict[str, Any]:
         "equity_irr_valid": eq_valid,
         "equity_npv": eq_npv,
         "going_in_cap": going_in_cap,
+        "cap_spread": cap_spread,
         "dscr_min": min_dscr,
         "dscr_y1": dscr_y1,
         "cash_on_cash": coc,
+        "cash_on_cash_avg": coc_avg,
         "equity_multiple": eq_mult,
+        "debt_yield": debt_yield,
+        "reserve": reserve,
         "passes": passes,
         "fail_reasons": reasons,
     }
+
+
+# --------------------------------------------------------------------------- #
+# 역산 & 손익분기 (스크리닝 보조)
+#   NPV(목표할인율) = 0 지점이 곧 Equity IRR = 목표 지점.
+#   NPV는 솔버 없이 항상 계산되고 입력에 단조이므로, IRR 솔버보다 견고하게 이분탐색 가능.
+# --------------------------------------------------------------------------- #
+def _levered_npv(d: Deal, rate: float) -> float:
+    """주어진 딜의 차입 현금흐름을 rate(소수)로 할인한 Equity NPV."""
+    breakdown = noi_breakdown(d)
+    noi = [row["noi"] for row in breakdown]
+    reserve = reserve_schedule(d, breakdown)
+    net_sale = terminal_value(d, noi)
+    ds, payoff = debt_schedule(d)
+    lcf, _ = levered_cf(d, noi, net_sale, ds, payoff, reserve)
+    return npv(rate, lcf)
+
+
+def max_acquisition_price(d: Deal, target_irr: float | None = None,
+                          min_dscr: float | None = None) -> Dict[str, Any]:
+    """목표 Equity IRR(과 최소 DSCR)을 만족하는 '최대 매입가'를 역산한다.
+
+    - price_irr : Equity NPV(목표IRR)=0 이 되는 가격(이분탐색). 이보다 비싸면 목표 IRR 미달.
+    - price_dscr: 최소 DSCR을 만족하는 최대 가격. DSCR ∝ 1/price 이므로 닫힌식.
+    - max_price : min(둘) — 둘 다 만족하는 최대 입찰가. binding = 더 빡빡한 쪽.
+    가격에 따라 NOI·순매각가는 불변, 대출·자기자본·상환만 비례 변동한다는 구조를 이용.
+    """
+    target = _pct(d.hurdle_irr if target_irr is None else target_irr)
+    mind = d.min_dscr if min_dscr is None else min_dscr
+
+    # 1) IRR(=NPV 0) 기준 최대가 — NPV(target)는 price에 단조감소
+    npv_at = lambda p: _levered_npv(replace(d, price=p), target)
+    lo = 1.0
+    if npv_at(lo) <= 0:
+        price_irr = 0.0                      # 아무리 싸도 목표 IRR 미달
+    else:
+        hi = max(d.price, 2.0)
+        unbounded = True
+        for _ in range(200):
+            if npv_at(hi) < 0:
+                unbounded = False
+                break
+            hi *= 2
+        if unbounded:
+            price_irr = math.inf
+        else:
+            for _ in range(100):
+                mid = (lo + hi) / 2
+                if npv_at(mid) > 0:
+                    lo = mid
+                else:
+                    hi = mid
+            price_irr = lo
+
+    # 2) DSCR 기준 최대가 — DSCR(p) = DSCR0 × price0/p  →  p = price0 × DSCR0/mind
+    r0 = evaluate(d)
+    if mind <= 0 or math.isinf(r0["dscr_min"]):
+        price_dscr = math.inf
+    else:
+        price_dscr = d.price * (r0["dscr_min"] / mind)
+
+    max_price = min(price_irr, price_dscr)
+    binding = "IRR" if price_irr <= price_dscr else "DSCR"
+    return {
+        "price_irr": price_irr,
+        "price_dscr": price_dscr,
+        "max_price": max_price,
+        "binding": binding,
+        "target_irr": target,
+    }
+
+
+_BREAKEVEN_RANGES = {
+    "exit_cap": (0.25, 30.0),      # 상한: 이보다 캡이 높아지면(가치↓) 탈락
+    "vacancy": (0.0, 99.0),        # 상한: 공실이 이보다 커지면 탈락
+    "rate": (0.0, 30.0),           # 상한: 금리가 이보다 오르면 탈락
+    "rent_growth": (-50.0, 50.0),  # 하한: 임대료성장이 이보다 낮으면 탈락
+}
+
+
+def break_even(d: Deal, field: str, target_irr: float | None = None):
+    """단일 변수의 손익분기값(Equity IRR=목표가 되는 임계값, %pt). 범위 내 없으면 None.
+
+    NPV(목표IRR)=0 지점을 이분탐색. 각 변수에 대해 NPV가 단조이므로 임계값이 유일.
+    """
+    rate = _pct(d.hurdle_irr if target_irr is None else target_irr)
+    lo, hi = _BREAKEVEN_RANGES[field]
+
+    def npv_at(v):
+        d2 = replace(d, **{field: v})
+        if validate(d2):
+            return None
+        return _levered_npv(d2, rate)
+
+    N = 80
+    pts = [lo + (hi - lo) * i / N for i in range(N + 1)]
+    vals = [npv_at(p) for p in pts]
+
+    bracket = None
+    fa = None
+    for i in range(N):
+        a, b = vals[i], vals[i + 1]
+        if a is None or b is None:
+            continue
+        if a == 0.0:
+            return pts[i]
+        if a * b < 0:
+            bracket = (pts[i], pts[i + 1])
+            fa = a
+            break
+    if bracket is None:
+        return None                          # 범위 내 손익분기 없음(항상 통과/항상 미달)
+
+    a, b = bracket
+    for _ in range(100):
+        mid = (a + b) / 2
+        fm = npv_at(mid)
+        if fm is None:
+            break
+        if fa * fm <= 0:
+            b = mid
+        else:
+            a, fa = mid, fm
+    return (a + b) / 2
