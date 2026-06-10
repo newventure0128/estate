@@ -101,33 +101,39 @@ def fmt_spread(x: float) -> str:
 def preset_deals() -> list[dict]:
     return [
         # 모두 '안정화된 수익형 자산' 예시 — 합성 데이터(실거래 아님), 한국 시장 범위로 보정.
-        # 자산유형 간 대비로 NOI→IRR→민감도와 양/음의 레버리지를 시연한다.
-        # 1) 프라임 오피스: 캡(~4%) < 금리(4.5%) → 음의 레버리지 사례
+        # 그로스 리스(임대인이 OpEx 부담) 모델에 잘 맞는 자산으로 구성:
+        # 임대주택은 진성 그로스, 오피스는 관리비 분리로 부분 그로스. (NNN 물류는 모델 부적합으로 제외)
+        # 세 딜로 양·중립·음의 레버리지를 한 번에 시연한다.
+        # 1) 임대주택 A: 적정가 매입. 캡(5.06%) > 금리(4.0%) → 양의 레버리지, PASS
+        #    (EqIRR 8.97% > ProjIRR 6.56% — 레버리지가 가치를 더해 허들 8% 통과)
         dict(
-            name="프라임 오피스(도심)", price=50_000_000_000, acq_cost_pct=5.5,
+            name="임대주택 A", price=21_000_000_000, acq_cost_pct=5.0,
+            gpr1=1_600_000_000, other_income=50_000_000, vacancy=4.0,
+            opex_basis="pct", opex1=33.0, opex_growth=2.0, rent_growth=2.5,
+            hold_years=10, exit_cap=5.0, selling_cost_pct=2.0,
+            ltv=55.0, rate=4.0, amort_type="IO", amort_term_years=30,
+            capex_reserve_pct=4.0,
+        ),
+        # 2) 임대주택 B: 같은 유형이나 고가매입(캡 4.57% ≈ 금리 4.5%) + 출구 캡 확장(→5.0%)
+        #    → 레버리지 효과 소멸, 허들 미달 FAIL. DSCR 1.84·DY 8.3%로 대주 기준은 통과하지만
+        #    지분 수익 허들은 못 넘는 사례(대주 OK ≠ 지분 OK).
+        dict(
+            name="임대주택 B", price=26_000_000_000, acq_cost_pct=5.5,
+            gpr1=1_900_000_000, other_income=50_000_000, vacancy=5.0,
+            opex_basis="pct", opex1=36.0, opex_growth=2.0, rent_growth=2.0,
+            hold_years=10, exit_cap=5.0, selling_cost_pct=2.0,
+            ltv=55.0, rate=4.5, amort_type="IO", amort_term_years=30,
+            capex_reserve_pct=5.0,
+        ),
+        # 3) 오피스(도심): 프라임 저캡(3.94%) < 금리(4.5%) → 음의 레버리지
+        #    EqIRR(-0.46%)가 ProjIRR(1.96%) 아래로 내려가는 전형, FAIL.
+        dict(
+            name="오피스(도심)", price=50_000_000_000, acq_cost_pct=5.5,
             gpr1=3_000_000_000, other_income=300_000_000, vacancy=4.0,
             opex_basis="pct", opex1=38.0, opex_growth=2.0, rent_growth=2.5,
             hold_years=5, exit_cap=4.5, selling_cost_pct=2.0,
             ltv=50.0, rate=4.5, amort_type="IO", amort_term_years=30,
             capex_reserve_pct=7.0,   # 오피스 TI/LC 부담 큼
-        ),
-        # 2) 물류센터: 캡(~6.6%) > 금리(5%) → 양의 레버리지, PASS 후보
-        dict(
-            name="물류센터(수도권)", price=20_000_000_000, acq_cost_pct=5.0,
-            gpr1=1_900_000_000, other_income=100_000_000, vacancy=6.0,
-            opex_basis="pct", opex1=30.0, opex_growth=2.0, rent_growth=1.5,
-            hold_years=5, exit_cap=6.5, selling_cost_pct=2.0,
-            ltv=60.0, rate=5.0, amort_type="IO", amort_term_years=30,
-            capex_reserve_pct=3.0,   # 물류 TI/LC 경미
-        ),
-        # 3) 임대주택 리츠: 중간 캡(~5%), 저변동 — 안정형
-        dict(
-            name="임대주택 리츠", price=24_000_000_000, acq_cost_pct=5.5,
-            gpr1=1_900_000_000, other_income=50_000_000, vacancy=5.0,
-            opex_basis="pct", opex1=36.0, opex_growth=2.0, rent_growth=2.0,
-            hold_years=10, exit_cap=5.0, selling_cost_pct=2.0,
-            ltv=50.0, rate=4.0, amort_type="IO", amort_term_years=30,
-            capex_reserve_pct=5.0,
         ),
     ]
 
